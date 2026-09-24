@@ -3,12 +3,35 @@ import threading
 import sys
 import os
 import gzip
+import base64
 
 directory = "."  # default to current folder if not provided
 
 if "--directory" in sys.argv:
     directory_index = sys.argv.index("--directory") + 1
     directory = sys.argv[directory_index]
+
+VALID_USERNAME = "admin"
+VALID_PASSWORD = "secret123"
+
+def check_auth(lines):
+    auth_header = ""
+    for line in lines[1:]:
+        if line.lower().startswith("authorization:"):
+            auth_header = line.split(":", 1)[1].strip()
+            break
+
+    if not auth_header.startswith("Basic "):
+        return False
+
+    encoded_creds = auth_header[len("Basic "):]
+    try:
+        decoded = base64.b64decode(encoded_creds).decode('utf-8')
+        username, password = decoded.split(":", 1)
+    except Exception:
+        return False
+
+    return username == VALID_USERNAME and password == VALID_PASSWORD
 
 def handle_client(client_socket):
     while True:
@@ -120,53 +143,60 @@ def handle_client(client_socket):
                         ).encode() + body
 
                 elif path.startswith("/files/"):
-                    filename = path[len("/files/"):]
-                    base_dir = os.path.realpath(directory)
-                    full_path = os.path.realpath(os.path.join(directory, filename))
-                    method = parts[0]
-
-                    if not full_path.startswith(base_dir + os.sep):
-                        response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
-
-                    elif method == "GET":
-                        if os.path.isfile(full_path):
-                            with open(full_path, "rb") as f:
-                                body = f.read()
-                            response = (
-                                f"HTTP/1.1 200 OK\r\n"
-                                f"Content-Type: application/octet-stream\r\n"
-                                f"Content-Length: {len(body)}\r\n"
-                                f"\r\n"
-                            ).encode() + body
-                        else:
-                            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-
-                    elif method == "HEAD":
-                        if os.path.isfile(full_path):
-                            file_size = os.path.getsize(full_path)
-                            response = (
-                                f"HTTP/1.1 200 OK\r\n"
-                                f"Content-Type: application/octet-stream\r\n"
-                                f"Content-Length: {file_size}\r\n"
-                                f"\r\n"
-                            ).encode()
-                        else:
-                            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-
-                    elif method == "POST" or method == "PUT":
-                        with open(full_path, "wb") as f:
-                            f.write(body_so_far)
-                        response = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
-
-                    elif method == "DELETE":
-                        if os.path.isfile(full_path):
-                            os.remove(full_path)
-                            response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
-                        else:
-                            response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-
+                    if not check_auth(lines):
+                        response = (
+                            b"HTTP/1.1 401 Unauthorized\r\n"
+                            b"WWW-Authenticate: Basic realm=\"Files\"\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
                     else:
-                        response = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+                        filename = path[len("/files/"):]
+                        base_dir = os.path.realpath(directory)
+                        full_path = os.path.realpath(os.path.join(directory, filename))
+                        method = parts[0]
+
+                        if not full_path.startswith(base_dir + os.sep):
+                            response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+
+                        elif method == "GET":
+                            if os.path.isfile(full_path):
+                                with open(full_path, "rb") as f:
+                                    body = f.read()
+                                response = (
+                                    f"HTTP/1.1 200 OK\r\n"
+                                    f"Content-Type: application/octet-stream\r\n"
+                                    f"Content-Length: {len(body)}\r\n"
+                                    f"\r\n"
+                                ).encode() + body
+                            else:
+                                response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+
+                        elif method == "HEAD":
+                            if os.path.isfile(full_path):
+                                file_size = os.path.getsize(full_path)
+                                response = (
+                                    f"HTTP/1.1 200 OK\r\n"
+                                    f"Content-Type: application/octet-stream\r\n"
+                                    f"Content-Length: {file_size}\r\n"
+                                    f"\r\n"
+                                ).encode()
+                            else:
+                                response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+
+                        elif method == "POST" or method == "PUT":
+                            with open(full_path, "wb") as f:
+                                f.write(body_so_far)
+                            response = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+
+                        elif method == "DELETE":
+                            if os.path.isfile(full_path):
+                                os.remove(full_path)
+                                response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+                            else:
+                                response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+
+                        else:
+                            response = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
 
                 else:
                     response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
