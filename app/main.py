@@ -4,6 +4,8 @@ import sys
 import os
 import gzip
 import base64
+import hashlib
+import ssl
 
 directory = "."  # default to current folder if not provided
 
@@ -12,7 +14,7 @@ if "--directory" in sys.argv:
     directory = sys.argv[directory_index]
 
 VALID_USERNAME = "admin"
-VALID_PASSWORD = "secret123"
+VALID_PASSWORD_HASH = "fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4"  # sha256("secret123")
 
 def check_auth(lines):
     auth_header = ""
@@ -31,7 +33,9 @@ def check_auth(lines):
     except Exception:
         return False
 
-    return username == VALID_USERNAME and password == VALID_PASSWORD
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+
+    return username == VALID_USERNAME and password_hash == VALID_PASSWORD_HASH
 
 def handle_client(client_socket):
     while True:
@@ -227,7 +231,12 @@ def main():
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("localhost", 4221))
     server_socket.listen()
-    print("Server is listening on port 4221...")
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile="../cert.pem", keyfile="../key.pem")
+    server_socket = context.wrap_socket(server_socket, server_side=True)
+
+    print("Server is listening on port 4221 (HTTPS)...")
     while True:
         client_socket, _ = server_socket.accept()
         thread = threading.Thread(target=handle_client, args=(client_socket,))
