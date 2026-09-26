@@ -5,6 +5,7 @@ import os
 import gzip
 import base64
 import hashlib
+import sqlite3
 import ssl
 
 directory = "."  # default to current folder if not provided
@@ -12,9 +13,6 @@ directory = "."  # default to current folder if not provided
 if "--directory" in sys.argv:
     directory_index = sys.argv.index("--directory") + 1
     directory = sys.argv[directory_index]
-
-VALID_USERNAME = "admin"
-VALID_PASSWORD_HASH = "fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4"  # sha256("secret123")
 
 def check_auth(lines):
     auth_header = ""
@@ -35,13 +33,22 @@ def check_auth(lines):
 
     password_hash = hashlib.sha256(password.encode()).hexdigest()
 
-    return username == VALID_USERNAME and password_hash == VALID_PASSWORD_HASH
+    conn = sqlite3.connect("../users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    conn.close()
+
+    if result is None:
+        return False
+
+    stored_hash = result[0]
+    return password_hash == stored_hash
 
 def handle_client(client_socket):
     while True:
         should_close = False
         try:
-            # ---- STAGE A: read until we have the full headers ----
             request_data = b""
             while b"\r\n\r\n" not in request_data:
                 chunk = client_socket.recv(1024)
@@ -50,16 +57,14 @@ def handle_client(client_socket):
                 request_data += chunk
 
             if not request_data:
-                break  # client disconnected before sending anything
+                break
 
-            # Decode just enough to parse the request line + headers
             header_end = request_data.find(b"\r\n\r\n") + 4
             header_text = request_data[:header_end].decode('utf-8')
             lines = header_text.split("\r\n")
             request_line = lines[0]
             parts = request_line.split(" ")
 
-            # ---- STAGE B: if there's a Content-Length, read until body is complete ----
             content_length = 0
             for line in lines[1:]:
                 if line.lower().startswith("content-length:"):
@@ -74,10 +79,8 @@ def handle_client(client_socket):
                 body_so_far += chunk
                 request_data += chunk
 
-            # Default response
             response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
 
-            # Check for Connection: close header
             connection_header = ""
             for line in lines[1:]:
                 if line.lower().startswith("connection:"):
@@ -205,7 +208,6 @@ def handle_client(client_socket):
                 else:
                     response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
 
-            # Patch in "Connection: close" if needed
             if should_close:
                 resp_header_end = response.find(b"\r\n")
                 response = response[:resp_header_end + 2] + b"Connection: close\r\n" + response[resp_header_end + 2:]
