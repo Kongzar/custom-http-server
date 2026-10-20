@@ -7,6 +7,7 @@ import base64
 import hashlib
 import sqlite3
 import ssl
+import hmac
 
 directory = "."  # default to current folder if not provided
 
@@ -31,19 +32,20 @@ def check_auth(lines):
     except Exception:
         return False
 
-    password_hash = hashlib.sha256(password.encode()).hexdigest()
-
     conn = sqlite3.connect("../users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT salt, password_hash FROM users WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
 
     if result is None:
         return False
 
-    stored_hash = result[0]
-    return password_hash == stored_hash
+    salt_hex, stored_hash = result
+    salt = bytes.fromhex(salt_hex)
+    attempt_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600000).hex()
+
+    return hmac.compare_digest(attempt_hash, stored_hash)
 
 def handle_client(client_socket):
     while True:
@@ -243,6 +245,6 @@ def main():
         client_socket, _ = server_socket.accept()
         thread = threading.Thread(target=handle_client, args=(client_socket,))
         thread.start()
-
+1
 if __name__ == "__main__":
     main()
