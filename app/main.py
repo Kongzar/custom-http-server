@@ -8,12 +8,30 @@ import hashlib
 import sqlite3
 import ssl
 import hmac
+import time
 
 directory = "."  # default to current folder if not provided
 
 if "--directory" in sys.argv:
     directory_index = sys.argv.index("--directory") + 1
     directory = sys.argv[directory_index]
+
+
+MAX_FAILURES = 5
+WINDOW_SECONDS = 60
+
+failed_attempts = {}
+attempts_lock = threading.Lock()
+
+def is_blocked(ip, now):
+    with attempts_lock:
+        recent = [t for t in failed_attempts.get(ip, []) if now - t < WINDOW_SECONDS]
+        failed_attempts[ip] = recent
+        return len(recent) >= MAX_FAILURES
+
+def record_failure(ip, now):
+    with attempts_lock:
+        failed_attempts.setdefault(ip, []).append(now)    
 
 def check_auth(lines):
     auth_header = ""
@@ -47,7 +65,7 @@ def check_auth(lines):
 
     return hmac.compare_digest(attempt_hash, stored_hash)
 
-def handle_client(client_socket):
+def handle_client(client_socket, client_ip):
     while True:
         should_close = False
         try:
@@ -152,7 +170,16 @@ def handle_client(client_socket):
                         ).encode() + body
 
                 elif path.startswith("/files/"):
-                    if not check_auth(lines):
+                    has_creds = any(ln.lower().startswith("authorization:") for ln in lines[1:])
+                    if is_blocked(client_ip, time.time()):
+                        response = (
+                            b"HTTP/1.1 429 Too Many Requests\r\n"
+                            b"Retry-After: 60\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                    elif not check_auth(lines):
+                        if has_creds:
+                            record_failure(client_ip, time.time())
                         response = (
                             b"HTTP/1.1 401 Unauthorized\r\n"
                             b"WWW-Authenticate: Basic realm=\"Files\"\r\n"
@@ -242,8 +269,8 @@ def main():
 
     print("Server is listening on port 4221 (HTTPS)...")
     while True:
-        client_socket, _ = server_socket.accept()
-        thread = threading.Thread(target=handle_client, args=(client_socket,))
+        client_socket, addr = server_socket.accept()
+        thread = threading.Thread(target=handle_client, args=(client_socket, addr[0]))
         thread.start()
 1
 if __name__ == "__main__":

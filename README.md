@@ -2,7 +2,7 @@
 
 A basic but genuinely functional HTTP/1.1 server built from raw TCP sockets in Python —
 no frameworks, no libraries beyond Python's standard library (`socket`, `threading`,
-`gzip`, `os`, `sys`, `base64`, `hashlib`, `hmac`, `sqlite3`, `ssl`).
+`gzip`, `os`, `sys`, `time`, `base64`, `hashlib`, `hmac`, `sqlite3`, `ssl`).
 
 ## Why this exists
 
@@ -11,8 +11,8 @@ challenge](https://codecrafters.io/challenges/http-server). I hit their paywall 
 through the "extract URL path" stage and didn't want to stop there, so I kept building
 it out with help from Claude (Anthropic's AI assistant) — both to finish the original
 challenge stages, and afterward to harden it toward something closer to a real-world
-implementation, then to extend it further into authentication, encryption, and
-persistent user storage.
+implementation, then to extend it further into authentication, encryption, persistent
+user storage, and brute-force protection.
 
 **I'm being upfront about this:** a lot of this code was written collaboratively with
 AI — I'd ask questions, get explanations and code, then test it myself, hit real bugs
@@ -58,6 +58,12 @@ thought was running wasn't actually the file that was running.
 - **Multiple users via a SQLite database** — `users.db` holds a `users` table
   (`username`, `salt`, `password_hash`); any number of users can be added without
   touching the server code, and `check_auth()` looks each one up at request time
+- **Per-IP rate limiting on failed logins** — after 5 failed attempts within 60 seconds,
+  an IP gets `429 Too Many Requests` with a `Retry-After` header. It uses a sliding
+  window (old failures age out one at a time) guarded by a `threading.Lock`, and the
+  block check runs *before* any database lookup or hashing, so a blocked client costs
+  the server almost nothing. Requests with no credentials at all (like a browser's
+  first visit before its login prompt) are not counted as failures
 
 ## What I learned building this
 
@@ -99,6 +105,15 @@ thought was running wasn't actually the file that was running.
 - **Basic SQL and SQLite** — creating a table, inserting rows with parameterized
   queries (`?` placeholders) instead of string-formatting values directly into SQL,
   specifically to avoid SQL injection, and looking a row up by a unique key
+- **How rate limiting works, and how it pairs with slow hashing** — slow hashing makes
+  each guess expensive for an attacker but also expensive for the server, so a flood
+  of bad logins is a way to burn CPU. Rate limiting caps the number of guesses, and the
+  limit check has to happen *before* the expensive hashing or it protects nothing. I
+  prototyped the sliding-window logic on its own with a fake clock first, which made
+  the behavior easy to predict and verify before wiring it into the server
+- **Shared state across threads needs a lock** — every client runs in its own thread,
+  and they all read and write the same failure-count dictionary, so access is wrapped
+  in a `threading.Lock`
 - A long, genuinely humbling debugging stretch where a `kongzar` user that was
   correctly stored in the database, with a hash that matched perfectly when checked
   by hand, still failed to authenticate — because the file being edited, saved, and
@@ -152,6 +167,12 @@ curl -k -u admin:secret123 -X DELETE https://localhost:4221/files/newfile.txt
 curl -k --compressed https://localhost:4221/echo/hello
 ```
 
+To see the rate limiter fire, send several wrong passwords in a row — attempts 1 to 5
+return `401`, then attempts 6 and later return `429` until old failures age out:
+```bash
+for i in 1 2 3 4 5 6 7; do curl -k -s -o /dev/null -w "attempt $i: %{http_code}\n" -u admin:wrong$i https://localhost:4221/files/hello.txt; done
+```
+
 `users.db`, `key.pem` and other local secrets are in `.gitignore` and are not part of
 the repo — you create your own.
 
@@ -162,10 +183,15 @@ This is not production-hardened. Specifically it's missing:
 - **Self-signed certificate** — browsers/clients will always show a trust warning
   unless you install your own cert as trusted locally. A real deployment needs a
   certificate from a trusted authority (e.g. Let's Encrypt)
-- **No rate limiting** — nothing stops someone from hammering `/files/` with password
-  guesses. Slow hashing makes each guess expensive for an attacker, but it also makes
-  each login attempt expensive for the server, so a flood of bad logins could be used
-  to tie up the CPU
+- **The rate limiter is basic:**
+  - State lives in memory, so restarting the server clears all failure counts
+  - An IP's entry is only cleaned up when that IP is checked again, so many distinct
+    IPs would make the dictionary grow; a real version needs periodic cleanup
+  - It limits per IP, not per account, so everyone behind one shared address (an
+    office, a proxy) shares one budget, and an attacker rotating IPs gets around it
+  - It only applies to `/files/`, since that's the only route with authentication
+  - While an IP is blocked, even the correct password is rejected — it can't tell the
+    real owner from an attacker sharing the address
 - **Hashing is standard-library only** — PBKDF2 with a high iteration count is a
   reasonable, widely used choice, but dedicated password hashes like bcrypt or Argon2
   (which need third-party packages) are generally preferred for new systems
@@ -184,6 +210,6 @@ something I'd point at the open internet as-is.
 
 ## What's next
 
-Possible next steps: a basic rate limiter for failed logins, an HTML directory listing
-for `/files/`, and maybe a comparison version using `asyncio` instead of threads to see
-how the concurrency model differs under load.
+Possible next steps: an HTML directory listing for `/files/`, periodic cleanup for the
+rate limiter's state, and maybe a comparison version using `asyncio` instead of threads
+to see how the concurrency model differs under load.
