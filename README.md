@@ -2,7 +2,8 @@
 
 A basic but genuinely functional HTTP/1.1 server built from raw TCP sockets in Python —
 no frameworks, no libraries beyond Python's standard library (`socket`, `threading`,
-`gzip`, `os`, `sys`, `time`, `base64`, `hashlib`, `hmac`, `sqlite3`, `ssl`).
+`gzip`, `os`, `sys`, `time`, `base64`, `hashlib`, `hmac`, `sqlite3`, `ssl`, `html`,
+`urllib.parse`).
 
 ## Why this exists
 
@@ -12,7 +13,7 @@ through the "extract URL path" stage and didn't want to stop there, so I kept bu
 it out with help from Claude (Anthropic's AI assistant) — both to finish the original
 challenge stages, and afterward to harden it toward something closer to a real-world
 implementation, then to extend it further into authentication, encryption, persistent
-user storage, and brute-force protection.
+user storage, brute-force protection, and safe HTML output.
 
 **I'm being upfront about this:** a lot of this code was written collaboratively with
 AI — I'd ask questions, get explanations and code, then test it myself, hit real bugs
@@ -32,6 +33,8 @@ thought was running wasn't actually the file that was running.
 - `GET /echo/{str}` — echoes a string back, with optional gzip compression
   (`Accept-Encoding: gzip`)
 - `GET /user-agent` — reads and returns the `User-Agent` request header
+- `GET /files/` — an HTML page listing the files in the served directory, each one a
+  clickable link (requires login)
 - `GET /files/{filename}` — serves a file from a configured directory
 - `HEAD /files/{filename}` — same as GET but headers only, no body
 - `POST /files/{filename}` / `PUT /files/{filename}` — writes the request body to a file
@@ -42,14 +45,18 @@ thought was running wasn't actually the file that was running.
 - Reads the *entire* request (headers + body) regardless of size, instead of trusting a
   single `recv()` call
 - Blocks directory traversal attempts (`/files/../../etc/passwd`) by resolving paths
-  with `os.path.realpath` and checking they stay inside the served directory
+  with `os.path.realpath` and checking they stay inside the served directory. The
+  filename is URL-decoded *before* that check, so encoded tricks like `%2e%2e/` are
+  caught too
 - Returns proper status codes for unsupported methods (`405`), missing files (`404`),
   path traversal attempts (`403`), and unexpected server errors (`500` instead of
   hanging the client)
 - **HTTP Basic Authentication** on all `/files/` routes — requires a username/password
   sent via the `Authorization` header before any file can be read, written, or deleted
 - **HTTPS/TLS support** — wraps the raw socket with Python's `ssl` module and a
-  self-signed certificate, encrypting the entire connection (not just the auth header)
+  self-signed certificate, encrypting the entire connection (not just the auth header).
+  A client that fails the TLS handshake (for example a browser that doesn't trust the
+  self-signed certificate) is logged and skipped instead of crashing the server
 - **Salted, slow password hashing** — passwords are never stored in plaintext. Each user
   gets a random 16-byte salt, and the password is hashed with PBKDF2-HMAC-SHA256 at
   600,000 iterations (`hashlib.pbkdf2_hmac`). Logins are verified by re-hashing the
@@ -64,6 +71,10 @@ thought was running wasn't actually the file that was running.
   block check runs *before* any database lookup or hashing, so a blocked client costs
   the server almost nothing. Requests with no credentials at all (like a browser's
   first visit before its login prompt) are not counted as failures
+- **Output escaping in the directory listing** — file names are untrusted input, so each
+  name is escaped for the context it appears in: `html.escape` for the visible text and
+  `urllib.parse.quote` for the link, which stops a file with a hostile name from
+  injecting HTML or script into the page (XSS)
 
 ## What I learned building this
 
@@ -114,6 +125,25 @@ thought was running wasn't actually the file that was running.
 - **Shared state across threads needs a lock** — every client runs in its own thread,
   and they all read and write the same failure-count dictionary, so access is wrapped
   in a `threading.Lock`
+- **Cross-site scripting (XSS) and output escaping** — the directory listing builds a
+  page out of file names, and file names are chosen by whoever can upload. A browser
+  treats text inside `< >` as instructions, so a file named
+  `<img src=x onerror=alert(1)>.txt` would run script for whoever opens the listing.
+  I demonstrated the problem and the fix in the Python shell first. It's the same idea
+  as SQL injection: untrusted text must stay data and never be interpreted as
+  instructions by whatever reads it next (a database, a browser, a terminal)
+- **Each context needs its own escaping** — the same file name appears as visible text
+  (`html.escape`) and inside a link (`urllib.parse.quote`), and they're different
+  contexts with different rules
+- **Decode before you check** — once links were URL-encoded, the server had to decode
+  incoming filenames, which meant the traversal check had to run *after* decoding.
+  Checking the encoded form first would have let `%2e%2e/` slip past. I confirmed it
+  with an encoded traversal attempt that correctly returned `403`
+- **Test with a real browser, not just curl** — `curl -k` ignores certificate problems,
+  so I never saw that a browser which doesn't trust my self-signed certificate aborts
+  the TLS handshake, and that one failed handshake crashed the whole server because the
+  error wasn't caught. Wrapping `accept()` fixed it. The general lesson: one client's
+  failure must never be able to take the server down
 - A long, genuinely humbling debugging stretch where a `kongzar` user that was
   correctly stored in the database, with a hash that matched perfectly when checked
   by hand, still failed to authenticate — because the file being edited, saved, and
@@ -161,11 +191,16 @@ Test it (note `https://` and `-k` since the cert is self-signed):
 curl -k https://localhost:4221/
 curl -k https://localhost:4221/echo/hello
 curl -k https://localhost:4221/user-agent -H "User-Agent: test/1.0"
+curl -k -u admin:secret123 https://localhost:4221/files/
 curl -k -u admin:secret123 https://localhost:4221/files/somefile.txt
 curl -k -u admin:secret123 -X POST https://localhost:4221/files/newfile.txt -d "some content"
 curl -k -u admin:secret123 -X DELETE https://localhost:4221/files/newfile.txt
 curl -k --compressed https://localhost:4221/echo/hello
 ```
+
+To use the file listing in a browser, open `https://localhost:4221/files/`. Because the
+certificate is self-signed, the browser will warn you. Choose Advanced, then proceed to
+localhost, and log in when prompted.
 
 To see the rate limiter fire, send several wrong passwords in a row — attempts 1 to 5
 return `401`, then attempts 6 and later return `429` until old failures age out:
@@ -183,6 +218,10 @@ This is not production-hardened. Specifically it's missing:
 - **Self-signed certificate** — browsers/clients will always show a trust warning
   unless you install your own cert as trusted locally. A real deployment needs a
   certificate from a trusted authority (e.g. Let's Encrypt)
+- **The TLS handshake happens on the main thread** — failed handshakes are now caught,
+  but a client that connects and then stalls partway through the handshake could still
+  hold up everyone else. A fuller fix moves the handshake into each client's thread
+  with a timeout
 - **The rate limiter is basic:**
   - State lives in memory, so restarting the server clears all failure counts
   - An IP's entry is only cleaned up when that IP is checked again, so many distinct
@@ -192,6 +231,9 @@ This is not production-hardened. Specifically it's missing:
   - It only applies to `/files/`, since that's the only route with authentication
   - While an IP is blocked, even the correct password is rejected — it can't tell the
     real owner from an attacker sharing the address
+- **The directory listing is minimal** — it shows only regular files in the top level
+  of the served folder, skips dotfiles and subfolders, and has no sorting, sizes or
+  dates. It sits behind the login, so it isn't public
 - **Hashing is standard-library only** — PBKDF2 with a high iteration count is a
   reasonable, widely used choice, but dedicated password hashes like bcrypt or Argon2
   (which need third-party packages) are generally preferred for new systems
@@ -202,7 +244,8 @@ This is not production-hardened. Specifically it's missing:
 - **Thread-per-connection concurrency** doesn't scale the way event-loop-based servers
   (nginx, `asyncio`) do under heavy load
 - Not fuzz-tested or hardened against malformed/malicious input beyond the specific
-  cases (directory traversal, bad methods, missing files) handled above
+  cases (directory traversal, bad methods, missing files, hostile file names) handled
+  above
 
 It's a solid learning project and a reasonable local tool (quick encrypted file
 transfer between devices on the same network, testing webhook receivers, etc.) — not
@@ -210,6 +253,6 @@ something I'd point at the open internet as-is.
 
 ## What's next
 
-Possible next steps: an HTML directory listing for `/files/`, periodic cleanup for the
-rate limiter's state, and maybe a comparison version using `asyncio` instead of threads
-to see how the concurrency model differs under load.
+Possible next steps: move the TLS handshake into each client's thread with a timeout,
+periodic cleanup for the rate limiter's state, and maybe a comparison version using
+`asyncio` instead of threads to see how the concurrency model differs under load.
