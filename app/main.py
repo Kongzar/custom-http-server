@@ -287,6 +287,20 @@ def handle_client(client_socket, client_ip):
 
     client_socket.close()
 
+    
+HANDSHAKE_TIMEOUT = 10
+
+def serve_connection(raw_socket, client_ip, context):
+    try:
+        raw_socket.settimeout(HANDSHAKE_TIMEOUT)
+        tls_socket = context.wrap_socket(raw_socket, server_side=True)
+        tls_socket.settimeout(None)
+    except (ssl.SSLError, OSError) as e:
+        print(f"Connection rejected during TLS handshake: {e}")
+        raw_socket.close()
+        return
+    handle_client(tls_socket, client_ip)
+
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -295,18 +309,12 @@ def main():
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile="../cert.pem", keyfile="../key.pem")
-    server_socket = context.wrap_socket(server_socket, server_side=True)
 
     print("Server is listening on port 4221 (HTTPS)...")
     while True:
-        try:
-            client_socket, addr = server_socket.accept()
-        except (ssl.SSLError, OSError) as e:
-            print(f"Connection rejected during TLS handshake: {e}")
-            continue
-        thread = threading.Thread(target=handle_client, args=(client_socket, addr[0]))
+        raw_socket, addr = server_socket.accept()
+        thread = threading.Thread(target=serve_connection, args=(raw_socket, addr[0], context))
         thread.start()
 
 if __name__ == "__main__":
     main()
-    
