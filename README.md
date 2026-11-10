@@ -13,7 +13,8 @@ through the "extract URL path" stage and didn't want to stop there, so I kept bu
 it out with help from Claude (Anthropic's AI assistant) — both to finish the original
 challenge stages, and afterward to harden it toward something closer to a real-world
 implementation, then to extend it further into authentication, encryption, persistent
-user storage, brute-force protection, and safe HTML output.
+user storage, brute-force protection, safe HTML output, and resilience against stalled
+connections.
 
 **I'm being upfront about this:** a lot of this code was written collaboratively with
 AI — I'd ask questions, get explanations and code, then test it myself, hit real bugs
@@ -53,10 +54,13 @@ thought was running wasn't actually the file that was running.
   hanging the client)
 - **HTTP Basic Authentication** on all `/files/` routes — requires a username/password
   sent via the `Authorization` header before any file can be read, written, or deleted
-- **HTTPS/TLS support** — wraps the raw socket with Python's `ssl` module and a
-  self-signed certificate, encrypting the entire connection (not just the auth header).
-  A client that fails the TLS handshake (for example a browser that doesn't trust the
-  self-signed certificate) is logged and skipped instead of crashing the server
+- **HTTPS/TLS support** — every connection is encrypted using Python's `ssl` module and
+  a self-signed certificate, encrypting the entire connection (not just the auth
+  header). The main thread only accepts raw connections; the TLS handshake runs in each
+  client's own thread with a 10-second timeout. A client that fails the handshake (for
+  example a browser that doesn't trust the self-signed certificate, or someone sending
+  plain `http://`) or stalls partway through it is logged and dropped without affecting
+  anyone else, and no request is ever read from a connection that hasn't completed it
 - **Salted, slow password hashing** — passwords are never stored in plaintext. Each user
   gets a random 16-byte salt, and the password is hashed with PBKDF2-HMAC-SHA256 at
   600,000 iterations (`hashlib.pbkdf2_hmac`). Logins are verified by re-hashing the
@@ -142,8 +146,30 @@ thought was running wasn't actually the file that was running.
 - **Test with a real browser, not just curl** — `curl -k` ignores certificate problems,
   so I never saw that a browser which doesn't trust my self-signed certificate aborts
   the TLS handshake, and that one failed handshake crashed the whole server because the
-  error wasn't caught. Wrapping `accept()` fixed it. The general lesson: one client's
-  failure must never be able to take the server down
+  error wasn't caught. The general lesson: one client's failure must never be able to
+  take the server down
+- **Don't do slow, unpredictable work on the thread everyone depends on** — I had
+  wrapped the listening socket in TLS, which meant the handshake ran inside `accept()`
+  on the main thread. I reproduced the problem on purpose: `nc localhost 4221` opens a
+  connection and says nothing, and while it sat there a normal curl request timed out.
+  The fix was to accept plain connections on the main thread and run each handshake in
+  the client's own thread with a timeout. Rerunning the same experiment, curl returned
+  `200` immediately and the silent connection was logged and dropped after 10 seconds.
+  I also confirmed that a plain `http://` request is refused, so splitting the
+  handshake out didn't weaken the encryption
+- **What a timeout does and doesn't cover** — the 10-second limit applies only to the
+  handshake. After it succeeds the timeout is removed so keep-alive connections can sit
+  idle between requests, which leaves a gap (see limitations). Being precise about what
+  a protection covers matters as much as adding it
+- **Verify the file on disk before running it** — I lost a lot of time to editing one
+  copy of a file and running another, and to pasted code that left a duplicate
+  `def main():` and a mis-indented constant. Checking with `grep` what's really saved,
+  and `python3 -m py_compile` before starting the server, catches this in seconds.
+  Unsaved editor changes were another repeat offender
+- **Prove your secrets are ignored, don't assume it** — a stray character in
+  `.gitignore` silently broke a rule that protects the private key. `git status`,
+  `git ls-files` and `git check-ignore -v` showed what git actually believed, and the
+  fix was caught before it was committed
 - A long, genuinely humbling debugging stretch where a `kongzar` user that was
   correctly stored in the database, with a hash that matched perfectly when checked
   by hand, still failed to authenticate — because the file being edited, saved, and
@@ -153,11 +179,10 @@ thought was running wasn't actually the file that was running.
   *what's running* and verify it directly, rather than re-checking the logic again
 - A bunch of debugging fundamentals that had nothing to do with HTTP specifically:
   killing stale processes on a port (`lsof -i :PORT` / `kill -9`), the fact that
-  `/tmp` gets wiped by macOS and isn't for anything you want to persist, that editors
-  need to actually save before a rerun picks up changes, that a Python shell started
-  in the wrong folder silently creates a second empty `users.db`, and untangling a
-  genuinely messy git situation involving two nested repositories and a remote that
-  was still pointed at CodeCrafters instead of GitHub
+  `/tmp` gets wiped by macOS and isn't for anything you want to persist, that a Python
+  shell started in the wrong folder silently creates a second empty `users.db`, and
+  untangling a genuinely messy git situation involving two nested repositories and a
+  remote that was still pointed at CodeCrafters instead of GitHub
 
 ## Running it
 
@@ -208,6 +233,14 @@ return `401`, then attempts 6 and later return `429` until old failures age out:
 for i in 1 2 3 4 5 6 7; do curl -k -s -o /dev/null -w "attempt $i: %{http_code}\n" -u admin:wrong$i https://localhost:4221/files/hello.txt; done
 ```
 
+To see the handshake timeout, open a silent connection in one terminal with
+`nc localhost 4221`, then make a normal request from another. The request succeeds
+immediately, and after 10 seconds the server logs that the silent connection was
+dropped:
+```bash
+curl --max-time 10 -k -s -o /dev/null -w "%{http_code}\n" https://localhost:4221/
+```
+
 `users.db`, `key.pem` and other local secrets are in `.gitignore` and are not part of
 the repo — you create your own.
 
@@ -218,10 +251,14 @@ This is not production-hardened. Specifically it's missing:
 - **Self-signed certificate** — browsers/clients will always show a trust warning
   unless you install your own cert as trusted locally. A real deployment needs a
   certificate from a trusted authority (e.g. Let's Encrypt)
-- **The TLS handshake happens on the main thread** — failed handshakes are now caught,
-  but a client that connects and then stalls partway through the handshake could still
-  hold up everyone else. A fuller fix moves the handshake into each client's thread
-  with a timeout
+- **No idle timeout after the handshake** — the 10-second limit covers only the TLS
+  handshake. Once it succeeds, the timeout is removed so keep-alive connections can sit
+  idle, which means a client that completes the handshake and then goes silent, or
+  sends half a request and stops, holds its thread indefinitely
+- **No cap on simultaneous connections** — every connection gets its own thread, so a
+  flood of connections can no longer freeze the server, but it can still use up
+  threads, memory and CPU (each handshake costs some crypto work). A real deployment
+  would add a connection limit and usually put a reverse proxy or firewall in front
 - **The rate limiter is basic:**
   - State lives in memory, so restarting the server clears all failure counts
   - An IP's entry is only cleaned up when that IP is checked again, so many distinct
@@ -253,6 +290,7 @@ something I'd point at the open internet as-is.
 
 ## What's next
 
-Possible next steps: move the TLS handshake into each client's thread with a timeout,
-periodic cleanup for the rate limiter's state, and maybe a comparison version using
-`asyncio` instead of threads to see how the concurrency model differs under load.
+Possible next steps: an idle timeout after the handshake, a cap on simultaneous
+connections, periodic cleanup for the rate limiter's state, and maybe a comparison
+version using `asyncio` instead of threads to see how the concurrency model differs
+under load.
