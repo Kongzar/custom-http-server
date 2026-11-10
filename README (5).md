@@ -1,0 +1,296 @@
+# Custom HTTP Server (Python, from scratch)
+
+A basic but genuinely functional HTTP/1.1 server built from raw TCP sockets in Python —
+no frameworks, no libraries beyond Python's standard library (`socket`, `threading`,
+`gzip`, `os`, `sys`, `time`, `base64`, `hashlib`, `hmac`, `sqlite3`, `ssl`, `html`,
+`urllib.parse`).
+
+## Why this exists
+
+This started as my attempt at the [CodeCrafters "Build Your Own HTTP Server"
+challenge](https://codecrafters.io/challenges/http-server). I hit their paywall partway
+through the "extract URL path" stage and didn't want to stop there, so I kept building
+it out with help from Claude (Anthropic's AI assistant) — both to finish the original
+challenge stages, and afterward to harden it toward something closer to a real-world
+implementation, then to extend it further into authentication, encryption, persistent
+user storage, brute-force protection, safe HTML output, and resilience against stalled
+connections.
+
+**I'm being upfront about this:** a lot of this code was written collaboratively with
+AI — I'd ask questions, get explanations and code, then test it myself, hit real bugs
+and debug them with AI's help too. I did type and run everything myself, and by the end
+I understood *why* each piece works, not just that it works — but I want that process to
+be visible rather than presented as if I wrote all of this unaided from a blank file. If
+you're evaluating this as a learning artifact, that's the honest context. This included
+some genuinely rough debugging stretches — see "What I learned" below for the more
+interesting ones, including a bug that took a long time to track down because the file I
+thought was running wasn't actually the file that was running.
+
+## What it does
+
+- Parses raw HTTP requests directly off a TCP socket (no `http.server`, no frameworks)
+- Routes based on path and method
+- `GET /` — basic health check
+- `GET /echo/{str}` — echoes a string back, with optional gzip compression
+  (`Accept-Encoding: gzip`)
+- `GET /user-agent` — reads and returns the `User-Agent` request header
+- `GET /files/` — an HTML page listing the files in the served directory, each one a
+  clickable link (requires login)
+- `GET /files/{filename}` — serves a file from a configured directory
+- `HEAD /files/{filename}` — same as GET but headers only, no body
+- `POST /files/{filename}` / `PUT /files/{filename}` — writes the request body to a file
+- `DELETE /files/{filename}` — deletes a file
+- Handles multiple simultaneous clients via one thread per connection
+- Supports persistent (keep-alive) connections — multiple requests per TCP connection,
+  closing only on `Connection: close` or client disconnect
+- Reads the *entire* request (headers + body) regardless of size, instead of trusting a
+  single `recv()` call
+- Blocks directory traversal attempts (`/files/../../etc/passwd`) by resolving paths
+  with `os.path.realpath` and checking they stay inside the served directory. The
+  filename is URL-decoded *before* that check, so encoded tricks like `%2e%2e/` are
+  caught too
+- Returns proper status codes for unsupported methods (`405`), missing files (`404`),
+  path traversal attempts (`403`), and unexpected server errors (`500` instead of
+  hanging the client)
+- **HTTP Basic Authentication** on all `/files/` routes — requires a username/password
+  sent via the `Authorization` header before any file can be read, written, or deleted
+- **HTTPS/TLS support** — every connection is encrypted using Python's `ssl` module and
+  a self-signed certificate, encrypting the entire connection (not just the auth
+  header). The main thread only accepts raw connections; the TLS handshake runs in each
+  client's own thread with a 10-second timeout. A client that fails the handshake (for
+  example a browser that doesn't trust the self-signed certificate, or someone sending
+  plain `http://`) or stalls partway through it is logged and dropped without affecting
+  anyone else, and no request is ever read from a connection that hasn't completed it
+- **Salted, slow password hashing** — passwords are never stored in plaintext. Each user
+  gets a random 16-byte salt, and the password is hashed with PBKDF2-HMAC-SHA256 at
+  600,000 iterations (`hashlib.pbkdf2_hmac`). Logins are verified by re-hashing the
+  submitted password with the user's stored salt and comparing with
+  `hmac.compare_digest` (a constant-time comparison)
+- **Multiple users via a SQLite database** — `users.db` holds a `users` table
+  (`username`, `salt`, `password_hash`); any number of users can be added without
+  touching the server code, and `check_auth()` looks each one up at request time
+- **Per-IP rate limiting on failed logins** — after 5 failed attempts within 60 seconds,
+  an IP gets `429 Too Many Requests` with a `Retry-After` header. It uses a sliding
+  window (old failures age out one at a time) guarded by a `threading.Lock`, and the
+  block check runs *before* any database lookup or hashing, so a blocked client costs
+  the server almost nothing. Requests with no credentials at all (like a browser's
+  first visit before its login prompt) are not counted as failures
+- **Output escaping in the directory listing** — file names are untrusted input, so each
+  name is escaped for the context it appears in: `html.escape` for the visible text and
+  `urllib.parse.quote` for the link, which stops a file with a hostile name from
+  injecting HTML or script into the page (XSS)
+
+## What I learned building this
+
+- How HTTP actually looks as raw bytes over a socket — the request line, headers,
+  `\r\n` line endings, and the `\r\n\r\n` separator between headers and body
+- Why a single `recv()` call isn't reliable for anything beyond trivially small
+  requests, and how to loop until you've actually received everything you were
+  promised (via `Content-Length`)
+- The difference between GET/POST/PUT/DELETE/HEAD semantically, not just as strings
+  to switch on
+- Why threading matters for concurrency, and how to actually test that it's working
+- What directory traversal attacks actually look like and how `os.path.realpath` +
+  a prefix check stops them — including discovering that my first "successful" test
+  of this was actually a false pass, because curl silently normalizes `..` out of a
+  URL unless you pass `--path-as-is`
+- Why unhandled exceptions in a request handler can silently hang a client forever,
+  and how `try/except` placement (wrapping the *processing*, not just the send)
+  fixes that
+- **How HTTP Basic Auth actually works** — that it's just Base64 encoding of
+  `username:password`, not encryption, and proved this to myself by decoding a
+  captured Basic Auth header with a single `base64 -d` command
+- **Why TLS/HTTPS matters** — captured my own server's traffic with `tcpdump` before
+  and after adding TLS. Without it, Basic Auth credentials are trivially readable.
+  With it, the same request is unreadable ciphertext to anyone watching the network
+- **What password hashing actually buys you** — that a hash is one-way (you can't
+  reverse it back to the password, not even as the legitimate owner, which is exactly
+  why "forgot password" flows always reset rather than recover), and saw the avalanche
+  effect firsthand (changing one character of input completely changes the output)
+- **Why plain SHA-256 isn't enough for passwords, and what salting fixes** — plain
+  SHA-256 gives identical hashes for identical passwords and is fast enough that an
+  attacker can try billions of guesses per second. A per-user random salt makes the
+  same password hash differently for every user (I proved this by hashing the same
+  password with two salts and getting two unrelated hashes), which defeats precomputed
+  rainbow tables. Many iterations make every guess expensive. The salt isn't secret —
+  it's stored right next to the hash, because its job is uniqueness, not secrecy
+- **Why hashes can't be migrated** — my existing users' plain SHA-256 hashes couldn't
+  be converted to the new scheme (hashing is one-way), so I had to drop the table and
+  re-add each user from their original password
+- **Basic SQL and SQLite** — creating a table, inserting rows with parameterized
+  queries (`?` placeholders) instead of string-formatting values directly into SQL,
+  specifically to avoid SQL injection, and looking a row up by a unique key
+- **How rate limiting works, and how it pairs with slow hashing** — slow hashing makes
+  each guess expensive for an attacker but also expensive for the server, so a flood
+  of bad logins is a way to burn CPU. Rate limiting caps the number of guesses, and the
+  limit check has to happen *before* the expensive hashing or it protects nothing. I
+  prototyped the sliding-window logic on its own with a fake clock first, which made
+  the behavior easy to predict and verify before wiring it into the server
+- **Shared state across threads needs a lock** — every client runs in its own thread,
+  and they all read and write the same failure-count dictionary, so access is wrapped
+  in a `threading.Lock`
+- **Cross-site scripting (XSS) and output escaping** — the directory listing builds a
+  page out of file names, and file names are chosen by whoever can upload. A browser
+  treats text inside `< >` as instructions, so a file named
+  `<img src=x onerror=alert(1)>.txt` would run script for whoever opens the listing.
+  I demonstrated the problem and the fix in the Python shell first. It's the same idea
+  as SQL injection: untrusted text must stay data and never be interpreted as
+  instructions by whatever reads it next (a database, a browser, a terminal)
+- **Each context needs its own escaping** — the same file name appears as visible text
+  (`html.escape`) and inside a link (`urllib.parse.quote`), and they're different
+  contexts with different rules
+- **Decode before you check** — once links were URL-encoded, the server had to decode
+  incoming filenames, which meant the traversal check had to run *after* decoding.
+  Checking the encoded form first would have let `%2e%2e/` slip past. I confirmed it
+  with an encoded traversal attempt that correctly returned `403`
+- **Test with a real browser, not just curl** — `curl -k` ignores certificate problems,
+  so I never saw that a browser which doesn't trust my self-signed certificate aborts
+  the TLS handshake, and that one failed handshake crashed the whole server because the
+  error wasn't caught. The general lesson: one client's failure must never be able to
+  take the server down
+- **Don't do slow, unpredictable work on the thread everyone depends on** — I had
+  wrapped the listening socket in TLS, which meant the handshake ran inside `accept()`
+  on the main thread. I reproduced the problem on purpose: `nc localhost 4221` opens a
+  connection and says nothing, and while it sat there a normal curl request timed out.
+  The fix was to accept plain connections on the main thread and run each handshake in
+  the client's own thread with a timeout. Rerunning the same experiment, curl returned
+  `200` immediately and the silent connection was logged and dropped after 10 seconds.
+  I also confirmed that a plain `http://` request is refused, so splitting the
+  handshake out didn't weaken the encryption
+- **What a timeout does and doesn't cover** — the 10-second limit applies only to the
+  handshake. After it succeeds the timeout is removed so keep-alive connections can sit
+  idle between requests, which leaves a gap (see limitations). Being precise about what
+  a protection covers matters as much as adding it
+- **Verify the file on disk before running it** — I lost a lot of time to editing one
+  copy of a file and running another, and to pasted code that left a duplicate
+  `def main():` and a mis-indented constant. Checking with `grep` what's really saved,
+  and `python3 -m py_compile` before starting the server, catches this in seconds.
+  Unsaved editor changes were another repeat offender
+- **Prove your secrets are ignored, don't assume it** — a stray character in
+  `.gitignore` silently broke a rule that protects the private key. `git status`,
+  `git ls-files` and `git check-ignore -v` showed what git actually believed, and the
+  fix was caught before it was committed
+- A long, genuinely humbling debugging stretch where a `kongzar` user that was
+  correctly stored in the database, with a hash that matched perfectly when checked
+  by hand, still failed to authenticate — because the file being edited, saved, and
+  inspected with `cat` was not, for a stretch, the same file the running server
+  process had actually loaded. The lesson: when every piece of logic checks out in
+  isolation but real behavior still contradicts it, stop trusting assumptions about
+  *what's running* and verify it directly, rather than re-checking the logic again
+- A bunch of debugging fundamentals that had nothing to do with HTTP specifically:
+  killing stale processes on a port (`lsof -i :PORT` / `kill -9`), the fact that
+  `/tmp` gets wiped by macOS and isn't for anything you want to persist, that a Python
+  shell started in the wrong folder silently creates a second empty `users.db`, and
+  untangling a genuinely messy git situation involving two nested repositories and a
+  remote that was still pointed at CodeCrafters instead of GitHub
+
+## Running it
+
+Generate a self-signed certificate once (from the repo root):
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+Create the user database once (from the repo root), then add at least one user. Each
+user needs their own random salt:
+```bash
+python3
+>>> import sqlite3, hashlib, os
+>>> conn = sqlite3.connect("users.db")
+>>> cursor = conn.cursor()
+>>> cursor.execute("CREATE TABLE users (username TEXT PRIMARY KEY, salt TEXT, password_hash TEXT)")
+>>> salt = os.urandom(16)
+>>> password_hash = hashlib.pbkdf2_hmac("sha256", "secret123".encode(), salt, 600000).hex()
+>>> cursor.execute("INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)", ("admin", salt.hex(), password_hash))
+>>> conn.commit()
+>>> exit()
+```
+
+Then run the server (from the `app/` folder):
+```bash
+python3 main.py --directory /path/to/some/folder
+```
+
+Test it (note `https://` and `-k` since the cert is self-signed):
+```bash
+curl -k https://localhost:4221/
+curl -k https://localhost:4221/echo/hello
+curl -k https://localhost:4221/user-agent -H "User-Agent: test/1.0"
+curl -k -u admin:secret123 https://localhost:4221/files/
+curl -k -u admin:secret123 https://localhost:4221/files/somefile.txt
+curl -k -u admin:secret123 -X POST https://localhost:4221/files/newfile.txt -d "some content"
+curl -k -u admin:secret123 -X DELETE https://localhost:4221/files/newfile.txt
+curl -k --compressed https://localhost:4221/echo/hello
+```
+
+To use the file listing in a browser, open `https://localhost:4221/files/`. Because the
+certificate is self-signed, the browser will warn you. Choose Advanced, then proceed to
+localhost, and log in when prompted.
+
+To see the rate limiter fire, send several wrong passwords in a row — attempts 1 to 5
+return `401`, then attempts 6 and later return `429` until old failures age out:
+```bash
+for i in 1 2 3 4 5 6 7; do curl -k -s -o /dev/null -w "attempt $i: %{http_code}\n" -u admin:wrong$i https://localhost:4221/files/hello.txt; done
+```
+
+To see the handshake timeout, open a silent connection in one terminal with
+`nc localhost 4221`, then make a normal request from another. The request succeeds
+immediately, and after 10 seconds the server logs that the silent connection was
+dropped:
+```bash
+curl --max-time 10 -k -s -o /dev/null -w "%{http_code}\n" https://localhost:4221/
+```
+
+`users.db`, `key.pem` and other local secrets are in `.gitignore` and are not part of
+the repo — you create your own.
+
+## Known limitations (honestly)
+
+This is not production-hardened. Specifically it's missing:
+
+- **Self-signed certificate** — browsers/clients will always show a trust warning
+  unless you install your own cert as trusted locally. A real deployment needs a
+  certificate from a trusted authority (e.g. Let's Encrypt)
+- **No idle timeout after the handshake** — the 10-second limit covers only the TLS
+  handshake. Once it succeeds, the timeout is removed so keep-alive connections can sit
+  idle, which means a client that completes the handshake and then goes silent, or
+  sends half a request and stops, holds its thread indefinitely
+- **No cap on simultaneous connections** — every connection gets its own thread, so a
+  flood of connections can no longer freeze the server, but it can still use up
+  threads, memory and CPU (each handshake costs some crypto work). A real deployment
+  would add a connection limit and usually put a reverse proxy or firewall in front
+- **The rate limiter is basic:**
+  - State lives in memory, so restarting the server clears all failure counts
+  - An IP's entry is only cleaned up when that IP is checked again, so many distinct
+    IPs would make the dictionary grow; a real version needs periodic cleanup
+  - It limits per IP, not per account, so everyone behind one shared address (an
+    office, a proxy) shares one budget, and an attacker rotating IPs gets around it
+  - It only applies to `/files/`, since that's the only route with authentication
+  - While an IP is blocked, even the correct password is rejected — it can't tell the
+    real owner from an attacker sharing the address
+- **The directory listing is minimal** — it shows only regular files in the top level
+  of the served folder, skips dotfiles and subfolders, and has no sorting, sizes or
+  dates. It sits behind the login, so it isn't public
+- **Hashing is standard-library only** — PBKDF2 with a high iteration count is a
+  reasonable, widely used choice, but dedicated password hashes like bcrypt or Argon2
+  (which need third-party packages) are generally preferred for new systems
+- **Basic Auth re-sends credentials on every request** — fine over TLS, but it means
+  every `/files/` request pays the hashing cost, and there are no sessions or tokens
+- **No account creation flow** — new users are added by hand via the Python shell,
+  not through the server itself
+- **Thread-per-connection concurrency** doesn't scale the way event-loop-based servers
+  (nginx, `asyncio`) do under heavy load
+- Not fuzz-tested or hardened against malformed/malicious input beyond the specific
+  cases (directory traversal, bad methods, missing files, hostile file names) handled
+  above
+
+It's a solid learning project and a reasonable local tool (quick encrypted file
+transfer between devices on the same network, testing webhook receivers, etc.) — not
+something I'd point at the open internet as-is.
+
+## What's next
+
+Possible next steps: an idle timeout after the handshake, a cap on simultaneous
+connections, periodic cleanup for the rate limiter's state, and maybe a comparison
+version using `asyncio` instead of threads to see how the concurrency model differs
+under load.
